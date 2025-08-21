@@ -1,0 +1,125 @@
+# Frontend.py
+
+import streamlit as st
+import Backend as be
+
+# For simplicity, we'll use a single user_id. In a multi-user app, this would be managed via a login system.
+USER_ID = "user123"
+
+def main():
+    st.title("Personal Fitness Tracker")
+
+    # Initialize the database table if it doesn't exist
+    be.create_fitness_transactions_table()
+
+    menu = ["User Profile", "Log Workout", "Workout History", "Friends & Leaderboard", "Goals", "Business Insights"]
+    choice = st.sidebar.selectbox("Menu", menu)
+
+    if choice == "User Profile":
+        st.subheader("User Profile")
+        profile = be.read_user_profile(USER_ID)
+
+        if profile:
+            st.write(f"**Name:** {profile.get('name')}")
+            st.write(f"**Email:** {profile.get('email')}")
+            st.write(f"**Weight:** {profile.get('weight')} kg")
+        else:
+            st.info("No profile found. Please create one.")
+
+        with st.form("profile_form"):
+            name = st.text_input("Name", value=profile.get('name') if profile else "")
+            email = st.text_input("Email", value=profile.get('email') if profile else "")
+            weight = st.number_input("Weight (kg)", value=float(profile.get('weight', 0)) if profile else 0.0)
+            submitted = st.form_submit_button("Update Profile")
+
+            if submitted:
+                be.update_user_profile(USER_ID, name, email, weight)
+                st.success("Profile updated!")
+
+    elif choice == "Log Workout":
+        st.subheader("Log a New Workout")
+        with st.form("workout_form"):
+            duration = st.number_input("Duration (minutes)", min_value=1)
+            num_exercises = st.number_input("Number of Exercises", min_value=1, step=1)
+            exercises = []
+            for i in range(num_exercises):
+                st.write(f"--- Exercise {i+1} ---")
+                ex_name = st.text_input(f"Exercise Name {i+1}")
+                ex_reps = st.number_input(f"Reps {i+1}", min_value=1, step=1)
+                ex_sets = st.number_input(f"Sets {i+1}", min_value=1, step=1)
+                ex_weight = st.number_input(f"Weight (kg) {i+1}", min_value=0.0)
+                exercises.append({"name": ex_name, "reps": ex_reps, "sets": ex_sets, "weight": ex_weight})
+
+            submitted = st.form_submit_button("Log Workout")
+            if submitted:
+                be.create_workout(USER_ID, duration, exercises)
+                st.success("Workout logged!")
+
+    elif choice == "Workout History":
+        st.subheader("Your Workout History")
+        workouts = be.read_workouts(USER_ID)
+        if workouts:
+            for workout in workouts:
+                with st.expander(f"Workout on {workout['transaction_date'].strftime('%Y-%m-%d')} - {workout['metric_value']} minutes"):
+                    exercises = be.read_exercises_for_workout(workout['transaction_id'])
+                    if exercises:
+                        for ex in exercises:
+                            extra_data = ex['extra_data']
+                            st.write(f"- **{extra_data['name']}**: {extra_data['sets']} sets of {extra_data['reps']} reps at {ex['metric_value']} kg")
+                    else:
+                        st.write("No exercises logged for this workout.")
+        else:
+            st.info("No workouts logged yet.")
+
+    elif choice == "Friends & Leaderboard":
+        st.subheader("Friends")
+        friends = be.read_friends(USER_ID)
+        st.write("Your friends:", friends)
+
+        with st.form("friend_form"):
+            friend_id = st.text_input("Friend's User ID")
+            add_submitted = st.form_submit_button("Add Friend")
+            remove_submitted = st.form_submit_button("Remove Friend")
+
+            if add_submitted:
+                be.create_friend(USER_ID, friend_id)
+                st.success(f"{friend_id} added as a friend.")
+            if remove_submitted:
+                be.delete_friend(USER_ID, friend_id)
+                st.warning(f"{friend_id} removed from friends.")
+
+        st.subheader("Leaderboard (This Week's Workout Minutes)")
+        leaderboard_data = be.get_leaderboard(USER_ID)
+        if leaderboard_data:
+            st.table(leaderboard_data)
+        else:
+            st.info("No workout data for this week's leaderboard.")
+
+    elif choice == "Goals":
+        st.subheader("Your Fitness Goals")
+        goals = be.read_goals(USER_ID)
+        if goals:
+            for goal in goals:
+                st.write(f"- {goal}")
+        else:
+            st.info("No goals set yet.")
+        
+        with st.form("goal_form"):
+            new_goal = st.text_area("Set a new goal")
+            submitted = st.form_submit_button("Set Goal")
+            if submitted:
+                be.create_goal(USER_ID, new_goal)
+                st.success("New goal set!")
+
+    elif choice == "Business Insights":
+        st.subheader("Your Business Insights")
+        insights = be.get_business_insights(USER_ID)
+        if insights:
+            for key, value in insights.items():
+                st.write(f"**{key}:** {value}")
+        else:
+            st.info("No workout data to generate insights.")
+
+
+if __name__ == '__main__':
+    main()
