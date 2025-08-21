@@ -1,0 +1,198 @@
+-- Finance Revenue & Expense Tracker — PostgreSQL Schema (Clean & Idempotent)
+-- Safe to re-run multiple times. Drops + creates in proper order.
+-- Works with PostgreSQL 12+.
+
+-- 1) Schema
+CREATE SCHEMA IF NOT EXISTS finance;
+SET search_path TO finance, public;
+
+-- 2) Drop views (if exist) to avoid dependency errors
+DROP VIEW IF EXISTS v_budget_vs_actual,
+                    v_monthly_category_totals,
+                    v_account_balances,
+                    v_monthly_totals,
+                    v_transactions_enriched CASCADE;
+
+-- 3) Drop tables in dependency order
+DROP TABLE IF EXISTS recurring_rules CASCADE;
+DROP TABLE IF EXISTS budgets CASCADE;
+DROP TABLE IF EXISTS transactions CASCADE;
+DROP TABLE IF EXISTS categories CASCADE;
+DROP TABLE IF EXISTS accounts CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
+
+-- 4) Core reference tables
+CREATE TABLE users (
+    user_id       BIGSERIAL PRIMARY KEY,
+    username      VARCHAR(50)  NOT NULL UNIQUE,
+    email         VARCHAR(100) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE accounts (
+    account_id   BIGSERIAL PRIMARY KEY,
+    user_id      BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    account_name VARCHAR(100) NOT NULL,
+    account_type VARCHAR(40)  NOT NULL, -- e.g., 'Bank', 'Cash', 'CreditCard'
+    currency     CHAR(3)      NOT NULL DEFAULT 'INR',
+    is_active    BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_accounts_user_name UNIQUE (user_id, account_name)
+);
+
+CREATE TABLE categories (
+    category_id   BIGSERIAL PRIMARY KEY,
+    user_id       BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    category_name VARCHAR(100) NOT NULL,
+    category_type VARCHAR(7)   NOT NULL CHECK (category_type IN ('Expense','Revenue')),
+    parent_id     BIGINT REFERENCES categories(category_id) ON DELETE SET NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_categories_user_name UNIQUE (user_id, category_name)
+);
+
+-- 5) Transactions
+CREATE TABLE transactions (
+    transaction_id   BIGSERIAL PRIMARY KEY,
+    user_id          BIGINT   NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    account_id       BIGINT   NOT NULL REFERENCES accounts(account_id) ON DELETE RESTRICT,
+    category_id      BIGINT   NOT NULL REFERENCES categories(category_id) ON DELETE RESTRICT,
+    transaction_type VARCHAR(7) NOT NULL CHECK (transaction_type IN ('Expense','Revenue')),
+    amount           NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+    transaction_date DATE     NOT NULL,
+    description      TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    signed_amount    NUMERIC(14,2) GENERATED ALWAYS AS (
+        CASE WHEN transaction_type = 'Revenue' THEN amount ELSE -amount END
+    ) STORED
+);
+
+-- 6) Budgets
+CREATE TABLE budgets (
+    budget_id    BIGSERIAL PRIMARY KEY,
+    user_id      BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    category_id  BIGINT NOT NULL REFERENCES categories(category_id) ON DELETE CASCADE,
+    amount       NUMERIC(14,2) NOT NULL CHECK (amount >= 0),
+    start_date   DATE NOT NULL,
+    end_date     DATE NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_budget_dates CHECK (start_date <= end_date),
+    CONSTRAINT uq_budget_user_cat_range UNIQUE (user_id, category_id, start_date, end_date)
+);
+
+-- 7) Recurring rules
+CREATE TABLE recurring_rules (
+    rule_id        BIGSERIAL PRIMARY KEY,
+    user_id        BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    account_id     BIGINT NOT NULL REFERENCES accounts(account_id) ON DELETE RESTRICT,
+    category_id    BIGINT NOT NULL REFERENCES categories(category_id) ON DELETE RESTRICT,
+    transaction_type VARCHAR(7) NOT NULL CHECK (transaction_type IN ('Expense','Revenue')),
+    amount         NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+    frequency      VARCHAR(20) NOT NULL CHECK (frequency IN ('Daily','Weekly','Monthly','Quarterly','Yearly')),
+    next_run_date  DATE NOT NULL,
+    description    TEXT,
+    is_active      BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 8) Helpful indexes
+CREATE INDEX idx_txn_user_date    ON transactions(user_id, transaction_date);
+CREATE INDEX idx_txn_user_cat     ON transactions(user_id, category_id);
+CREATE INDEX idx_txn_user_account ON transactions(user_id, account_id);
+CREATE INDEX idx_cat_user_type    ON categories(user_id, category_type);
+CREATE INDEX idx_budget_user_cat  ON budgets(user_id, category_id);
+
+-- 9) Views
+
+-- Enriched transactions
+CREATE OR REPLACE VIEW v_transactions_enriched AS
+SELECT
+    t.transaction_id,
+    t.user_id,
+    u.username,
+    t.transaction_date,
+    t.transaction_type,
+    t.amount,
+    t.signed_amount,
+    t.description,
+    a.account_id,
+    a.account_name,
+    a.account_type,
+    c.category_id,
+    c.category_name,
+    c.category_type
+FROM transactions t
+JOIN users u      ON u.user_id = t.user_id
+JOIN accounts a   ON a.account_id = t.account_id
+JOIN categories c ON c.category_id = t.category_id;
+
+-- Monthly totals
+CREATE OR REPLACE VIEW v_monthly_totals AS
+SELECT
+    user_id,
+    date_trunc('month', transaction_date)::date AS month_start,
+    transaction_type,
+    COUNT(*)    AS txn_count,
+    SUM(amount) AS total_amount,
+    AVG(amount) AS avg_amount,
+    MIN(amount) AS min_amount,
+    MAX(amount) AS max_amount
+FROM transactions
+GROUP BY user_id, date_trunc('month', transaction_date), transaction_type
+ORDER BY user_id, month_start, transaction_type;
+
+-- Account balances
+CREATE OR REPLACE VIEW v_account_balances AS
+SELECT
+    a.user_id,
+    a.account_id,
+    a.account_name,
+    a.currency,
+    COALESCE(SUM(t.signed_amount), 0) AS balance
+FROM accounts a
+LEFT JOIN transactions t ON t.account_id = a.account_id
+GROUP BY a.user_id, a.account_id, a.account_name, a.currency
+ORDER BY a.user_id, a.account_name;
+
+-- Monthly category totals
+CREATE OR REPLACE VIEW v_monthly_category_totals AS
+SELECT
+    t.user_id,
+    date_trunc('month', t.transaction_date)::date AS month_start,
+    c.category_id,
+    c.category_name,
+    c.category_type,
+    COUNT(*)    AS txn_count,
+    SUM(t.amount) AS total_amount
+FROM transactions t
+JOIN categories c ON c.category_id = t.category_id
+GROUP BY t.user_id, date_trunc('month', t.transaction_date), c.category_id, c.category_name, c.category_type
+ORDER BY t.user_id, month_start, c.category_type, total_amount DESC;
+
+-- Budget vs Actual
+CREATE OR REPLACE VIEW v_budget_vs_actual AS
+SELECT
+    b.budget_id,
+    b.user_id,
+    b.category_id,
+    c.category_name,
+    c.category_type,
+    b.start_date,
+    b.end_date,
+    b.amount AS budget_amount,
+    COALESCE(SUM(t.amount), 0) AS actual_amount,
+    COALESCE(SUM(t.amount), 0) - b.amount AS variance
+FROM budgets b
+JOIN categories c ON c.category_id = b.category_id
+LEFT JOIN transactions t
+  ON t.user_id = b.user_id
+ AND t.category_id = b.category_id
+ AND t.transaction_date BETWEEN b.start_date AND b.end_date
+GROUP BY b.budget_id, b.user_id, b.category_id, c.category_name, c.category_type, b.start_date, b.end_date, b.amount
+ORDER BY b.user_id, b.start_date, c.category_name;
+
+-- Done ✔
+
+
+
+
