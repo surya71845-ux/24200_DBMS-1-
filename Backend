@@ -1,0 +1,224 @@
+import psycopg2
+import psycopg2.extras
+import json
+import uuid
+from contextlib import contextmanager
+
+# --- Database Connection ---
+# ⚠️ Change these details as per your local setup
+DB_PARAMS = {
+    "dbname": "Fitness_tracker",   # Use lowercase unless DB was created with quotes
+    "user": "postgres",
+    "password": "root",            # replace if needed
+    "host": "localhost",
+    "port": "5432"
+}
+
+@contextmanager
+def get_db_connection():
+    """Context manager for database connection with error logging."""
+    conn = None
+    try:
+        conn = psycopg2.connect(**DB_PARAMS)
+        yield conn
+    except Exception as e:
+        print("❌ Database connection failed:", e)
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+# --- Database Initialization ---
+def create_fitness_transactions_table():
+    """Creates the fitness_transactions table if it doesn't exist."""
+    create_table_query = """
+    CREATE TABLE IF NOT EXISTS fitness_transactions (
+        transaction_id      VARCHAR(255) PRIMARY KEY,
+        user_id             VARCHAR(255) NOT NULL,
+        transaction_date    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        transaction_type    VARCHAR(50) NOT NULL,
+        description         TEXT,
+        metric_value        DECIMAL(10,2),
+        metric_unit         VARCHAR(50),
+        related_user_id     VARCHAR(255),
+        parent_transaction  VARCHAR(255),
+        extra_data          JSONB
+    );
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(create_table_query)
+            conn.commit()
+    print("✅ fitness_transactions table ready.")
+
+# --- User Profile (CRUD) ---
+def create_user_profile(user_id, name, email, weight):
+    extra_data = {"name": name, "email": email, "weight": weight}
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fitness_transactions (transaction_id, user_id, transaction_type, extra_data) "
+                "VALUES (%s, %s, 'USER_PROFILE', %s)",
+                (str(uuid.uuid4()), user_id, json.dumps(extra_data))
+            )
+            conn.commit()
+
+def read_user_profile(user_id):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT extra_data FROM fitness_transactions "
+                "WHERE user_id = %s AND transaction_type = 'USER_PROFILE' "
+                "ORDER BY transaction_date DESC LIMIT 1",
+                (user_id,)
+            )
+            profile = cur.fetchone()
+            return profile["extra_data"] if profile else None
+
+def update_user_profile(user_id, name, email, weight):
+    create_user_profile(user_id, name, email, weight)
+
+# --- Workouts (CRUD) ---
+def create_workout(user_id, duration_minutes, exercises):
+    workout_id = str(uuid.uuid4())
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fitness_transactions (transaction_id, user_id, transaction_type, metric_value, metric_unit) "
+                "VALUES (%s, %s, 'WORKOUT_LOG', %s, 'minutes')",
+                (workout_id, user_id, duration_minutes)
+            )
+            for exercise in exercises:
+                exercise_id = str(uuid.uuid4())
+                extra_data = {
+                    "name": exercise["name"],
+                    "reps": exercise["reps"],
+                    "sets": exercise["sets"]
+                }
+                cur.execute(
+                    "INSERT INTO fitness_transactions (transaction_id, user_id, transaction_type, metric_value, metric_unit, parent_transaction, extra_data) "
+                    "VALUES (%s, %s, 'EXERCISE_LOG', %s, 'kg', %s, %s)",
+                    (exercise_id, user_id, exercise["weight"], workout_id, json.dumps(extra_data))
+                )
+            conn.commit()
+
+def read_workouts(user_id):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM fitness_transactions WHERE user_id = %s AND transaction_type = 'WORKOUT_LOG' "
+                "ORDER BY transaction_date DESC",
+                (user_id,)
+            )
+            return cur.fetchall()
+
+def read_exercises_for_workout(workout_id):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM fitness_transactions WHERE parent_transaction = %s ORDER BY transaction_date",
+                (workout_id,)
+            )
+            return cur.fetchall()
+
+# --- Friends (CRUD) ---
+def create_friend(user_id, friend_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fitness_transactions (transaction_id, user_id, transaction_type, related_user_id) "
+                "VALUES (%s, %s, 'FRIEND_ADD', %s)",
+                (str(uuid.uuid4()), user_id, friend_id)
+            )
+            conn.commit()
+
+def read_friends(user_id):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT DISTINCT related_user_id FROM fitness_transactions "
+                "WHERE user_id = %s AND transaction_type = 'FRIEND_ADD'",
+                (user_id,)
+            )
+            return [row["related_user_id"] for row in cur.fetchall()]
+
+def delete_friend(user_id, friend_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fitness_transactions (transaction_id, user_id, transaction_type, related_user_id) "
+                "VALUES (%s, %s, 'FRIEND_REMOVE', %s)",
+                (str(uuid.uuid4()), user_id, friend_id)
+            )
+            conn.commit()
+
+# --- Goals (CRUD) ---
+def create_goal(user_id, goal_description):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fitness_transactions (transaction_id, user_id, transaction_type, description) "
+                "VALUES (%s, %s, 'GOAL_SET', %s)",
+                (str(uuid.uuid4()), user_id, goal_description)
+            )
+            conn.commit()
+
+def read_goals(user_id):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT description FROM fitness_transactions WHERE user_id = %s AND transaction_type = 'GOAL_SET' "
+                "ORDER BY transaction_date DESC",
+                (user_id,)
+            )
+            return [row["description"] for row in cur.fetchall()]
+
+# --- Leaderboard & Insights ---
+def get_leaderboard(user_id):
+    friends = read_friends(user_id)
+    all_users = friends + [user_id]
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT user_id, SUM(metric_value) as total_minutes FROM fitness_transactions "
+                "WHERE user_id = ANY(%s) AND transaction_type = 'WORKOUT_LOG' "
+                "AND transaction_date >= date_trunc('week', current_date) "
+                "GROUP BY user_id ORDER BY total_minutes DESC",
+                (all_users,)
+            )
+            return cur.fetchall()
+
+def get_business_insights(user_id):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("SELECT COUNT(*) FROM fitness_transactions WHERE user_id = %s AND transaction_type = 'WORKOUT_LOG'", (user_id,))
+            workout_count = cur.fetchone()[0]
+
+            cur.execute("SELECT SUM(metric_value) FROM fitness_transactions WHERE user_id = %s AND transaction_type = 'WORKOUT_LOG'", (user_id,))
+            total_duration = cur.fetchone()[0]
+
+            cur.execute("SELECT AVG(metric_value) FROM fitness_transactions WHERE user_id = %s AND transaction_type = 'WORKOUT_LOG'", (user_id,))
+            avg_duration = cur.fetchone()[0]
+
+            cur.execute("SELECT MIN(metric_value) FROM fitness_transactions WHERE user_id = %s AND transaction_type = 'WORKOUT_LOG'", (user_id,))
+            min_duration = cur.fetchone()[0]
+
+            cur.execute("SELECT MAX(metric_value) FROM fitness_transactions WHERE user_id = %s AND transaction_type = 'WORKOUT_LOG'", (user_id,))
+            max_duration = cur.fetchone()[0]
+
+            return {
+                "Total Workouts": workout_count,
+                "Total Duration (minutes)": total_duration,
+                "Average Duration (minutes)": avg_duration,
+                "Shortest Workout (minutes)": min_duration,
+                "Longest Workout (minutes)": max_duration
+            }
+
+if __name__ == "__main__":
+    try:
+        with get_db_connection() as conn:
+            print("✅ Connected to database:", DB_PARAMS["dbname"])
+        create_fitness_transactions_table()
+        print("✅ Database table initialized.")
+    except Exception as e:
+        print("❌ Startup failed:", e)
